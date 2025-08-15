@@ -213,26 +213,54 @@ def find_amount(text: str, keys):
         return to_num(totals[-1])
     return 0.0
 
+# ✅ PARCHE: flags como argumento, soporta CUIT con puntos: "C.U.I.T."
 def find_cuit(text: str):
-    m = re.search(r'(?i)CUIT[^\d]*([0-9]{2}-?[0-9]{8}-?[0-9])', text)
+    # "C.U.I.T:" / "CUIT :" / "CUIT"
+    m = re.search(
+        r'C\.?\s*U\.?\s*I\.?\s*T\.?\s*[:\s-]*([0-9]{2}-?[0-9]{8}-?[0-9])',
+        text,
+        flags=re.IGNORECASE
+    )
     if not m:
+        # cualquier XX-XXXXXXXX-X aislado
         m = re.search(r'\b([0-9]{2}-?[0-9]{8}-?[0-9])\b', text)
     if m:
         digits = re.sub(r'\D', '', m.group(1))
         return f"{digits[:2]}-{digits[2:10]}-{digits[10:]}"
     return ""
 
+# ✅ PARCHE: flags como argumento, soporta "Factura" / "Facturas" / "FC"
 def find_pto_vta_y_nro(text: str):
-    m1 = re.search(r'(?i)pto\.?\s*de\s*venta\s*(\d+).*?(?i)(comp\.?\s*nro\.?|nro\.?)\s*(\d+)', text)
-    m2 = re.search(r'(?i)factura\s*[a-z]?\s*.*?(\d{4})-(\d{8})', text)
-    if m1:
-        return (m1.group(1), m1.group(2))
-    if m2:
-        return (m2.group(1), m2.group(2))
-    return ("","")
+    # 1) "Pto de Venta 0001 ... Comp. Nro 00000012"
+    m = re.search(
+        r'pto\.?\s*de\s*venta\s*(\d+).*?(comp\.?\s*nro\.?|nro\.?)\s*(\d+)',
+        text,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+    if m:
+        return (m.group(1), m.group(3))
+
+    # 2) "Factura(s) A ... 0001-00000012" (acepta A/B/C/M/E, etc.)
+    m = re.search(
+        r'facturas?\s*[A-Z]?\s*.*?(\d{4})-(\d{8})',
+        text,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+    if m:
+        return (m.group(1), m.group(2))
+
+    # 3) Fallback línea por línea: si la línea menciona factura/FC/comprob/pto venta,
+    #    buscá un patrón 0001-00000012 en esa línea
+    for line in text.splitlines():
+        if re.search(r'\b(fact|fc|comprob|pto\.?\s*de\s*venta)\b', line, flags=re.IGNORECASE):
+            mm = re.search(r'\b(\d{4})-(\d{8})\b', line)
+            if mm:
+                return (mm.group(1), mm.group(2))
+
+    return ("", "")
 
 def find_cae(text: str):
-    m = re.search(r'(?i)\bCAE\b[^\d]*([0-9]{8,14})', text)
+    m = re.search(r'\bCAE\b[^\d]*([0-9]{8,14})', text, flags=re.IGNORECASE)
     return m.group(1) if m else ""
 
 def parse_invoice_text(text: str, known_vendors):
@@ -255,7 +283,7 @@ def parse_invoice_text(text: str, known_vendors):
             proveedor = name
             break
     if not proveedor:
-        m = re.search(r'(?i)raz[oó]n\s+social[:\s]*([A-Z0-9\-\.\&\s]+)', text)
+        m = re.search(r'raz[oó]n\s+social[:\s]*([A-Z0-9\-\.\&\s]+)', text, flags=re.IGNORECASE)
         if m:
             proveedor = m.group(1).strip()
     if not proveedor:
@@ -384,7 +412,8 @@ if not parts:
 consolidated = pd.concat(parts, ignore_index=True, sort=False)
 
 # Asegurar columnas mínimas
-for col in ["Fecha","Mes_dt","Mes","ImporteTotal","Proveedor","Rubro","Clave","IVA","RowID","CUIT_Emisor","PtoVta","NroCpbte","CAE","Fuente"]:
+for col in ["Fecha","Mes_dt","Mes","ImporteTotal","Proveedor","Rubro","Clave","IVA","RowID",
+            "CUIT_Emisor","PtoVta","NroCpbte","CAE","Fuente"]:
     if col not in consolidated.columns:
         if col in ["ImporteTotal","IVA"]:
             consolidated[col] = 0.0
@@ -393,7 +422,7 @@ for col in ["Fecha","Mes_dt","Mes","ImporteTotal","Proveedor","Rubro","Clave","I
 
 # Recalcular Mes si faltan valores
 if consolidated["Mes"].eq("").any():
-    consolidated["Mes_dt"] = pd.to_datetime(consolidated["Fecha"], errors="coerce").dt.to_period("M")
+    consolidated["Mes_dt"] = pd.to_datetime(consolidated["Fecha"], errors="coerce").to_period("M")
     consolidated["Mes"] = consolidated["Mes_dt"].astype(str)
 
 # Dedupe por Clave (fuerte)
@@ -403,26 +432,26 @@ count_after = len(consolidated)
 dups_removed = count_before - count_after
 
 # ========= Duplicados potenciales (mismo total y ±1 día) =========
-# Bucket por CUIT (si hay), total redondeado y ventana de fecha (-1, 0, +1)
 c = consolidated.copy()
 c["CUIT_norm"] = c["CUIT_Emisor"].apply(digits_only)
 c["TotalRound"] = c["ImporteTotal"].round(2)
 c["FechaDay"] = pd.to_datetime(c["Fecha"], errors="coerce").dt.floor("D")
 
-# filas que no tengan fecha o total no se pueden comparar
+# Filtrar filas comparables
 c = c.dropna(subset=["FechaDay"])
 c = c[c["TotalRound"].notna()]
 
-# armamos buckets: día, día-1, día+1
+# Buckets para 0, -1 y +1 día respecto de cada registro
 tmp0 = c[["RowID","CUIT_norm","Proveedor","TotalRound","FechaDay"]].copy()
 tmp0["Bucket"] = tmp0["FechaDay"]
 
-tmpm = tmp0.copy(); tmpm["Bucket"] = tmpm["FechaDay"] - pd.Timedelta(days=1)
-tmpp = tmp0.copy(); tmpp["Bucket"] = tmpm["FechaDay"] + pd.Timedelta(days=2)  # +1 desde el original (0 + 2 por haber restado 1 en tmpm)
+tmpm1 = tmp0.copy()
+tmpm1["Bucket"] = tmp0["FechaDay"] - pd.Timedelta(days=1)
 
-# NOTA: la línea anterior crea +1 real respecto a tmp0:  (FechaDay-1)+2 => FechaDay+1
+tmpp1 = tmp0.copy()
+tmpp1["Bucket"] = tmp0["FechaDay"] + pd.Timedelta(days=1)
 
-cand = pd.concat([tmp0, tmpm, tmpp], ignore_index=True)
+cand = pd.concat([tmp0, tmpm1, tmpp1], ignore_index=True)
 
 # Si hay CUIT, agrupamos por CUIT; si no, por Proveedor (fallback)
 cand["ClaveGrupo"] = cand.apply(
@@ -440,7 +469,7 @@ pot = cand[cand["ClaveGrupo"].isin(grupo_validos)].merge(
     how="left"
 )
 
-# Nos quedamos con 1 fila por RowID (puede aparecer en varios buckets)
+# 1 fila por RowID
 pot_unique = pot.sort_values("Bucket").drop_duplicates(subset=["RowID"], keep="first").copy()
 pot_unique.rename(columns={"Bucket":"GrupoFecha"}, inplace=True)
 pot_unique["GrupoFecha"] = pot_unique["GrupoFecha"].dt.date
