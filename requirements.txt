@@ -2,3 +2,6 @@ streamlit>=1.36
 pandas>=2.0
 plotly>=5.20
 pymupdf>=1.23
+google-api-python-client
+google-auth
+google-auth-oauthlib
