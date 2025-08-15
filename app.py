@@ -44,12 +44,20 @@ MAP_RUBRO = {
 }
 
 def to_num(x):
-    if pd.isna(x): return 0.0
-    s = str(x).strip().replace("$","").replace("AR$","").replace("ARS","").replace(" ", "")
-    # miles . y decimales , -> 1.234.567,89
-    if "," in s and "." in s and s.rfind(",") > s.rfind("."):
-        s = s.replace(".", "").replace(",", ".")
+    """Convierte a float aceptando formatos AR (1.234.567,89) y US (1,234,567.89)."""
+    if pd.isna(x):
+        return 0.0
+    s = str(x).strip().replace("AR$","").replace("ARS","").replace("$","").replace(" ", "")
+    if "," in s and "." in s:
+        # Determinar separador decimal por la última aparición
+        if s.rfind(".") > s.rfind(","):
+            # 1,234,567.89 -> quitar comas, dejar punto
+            s = s.replace(",", "")
+        else:
+            # 1.234.567,89 -> quitar puntos, coma -> punto
+            s = s.replace(".", "").replace(",", ".")
     else:
+        # Solo uno de los separadores: si es coma, usarla como decimal
         s = s.replace(",", ".")
     try:
         return float(s)
@@ -63,8 +71,9 @@ def make_key_from_row(r):
     """Clave fuerte para dedupe:
        1) CUIT + PtoVta + Nro
        2) CUIT + CAE
-       3) CUIT + Fecha + Total
-       4) Proveedor + Fecha + Total (fallback)
+       3) PtoVta + Nro (sin CUIT)
+       4) CUIT + Fecha + Total
+       5) Proveedor + Fecha + Total (fallback)
     """
     cuit = digits_only(r.get("CUIT_Emisor",""))
     pto  = digits_only(r.get("PtoVta",""))
@@ -77,6 +86,8 @@ def make_key_from_row(r):
         return f"{cuit}-{pto.zfill(4)}-{nro.zfill(8)}"
     if cuit and cae:
         return f"{cuit}-{cae}"
+    if pto and nro:
+        return f"{pto.zfill(4)}-{nro.zfill(8)}"
     if cuit and pd.notna(fecha) and pd.notna(total) and float(total) > 0:
         return f"{cuit}-{pd.to_datetime(fecha).strftime('%Y%m%d')}-{float(total):.2f}"
     prov = str(r.get("Proveedor","")).strip()
@@ -187,8 +198,14 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
             text += page.get_text("text") + "\n"
     return text
 
-def find_first_date(text: str):
-    # dd/mm/yyyy o dd-mm-yyyy
+def find_issue_date(text: str):
+    """Prioriza 'Fecha: dd/mm/aaaa'; si no, toma la primera fecha razonable."""
+    m = re.search(r'Fecha\s*:\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', text, flags=re.IGNORECASE)
+    if m:
+        try:
+            return pd.to_datetime(m.group(1), dayfirst=True, errors="raise")
+        except:
+            pass
     candidates = re.findall(r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', text)
     for c in candidates:
         try:
@@ -201,19 +218,18 @@ def find_first_date(text: str):
 
 def find_amount(text: str, keys):
     lines = text.splitlines()
-    pat_num = re.compile(r'[\$]?\s*\d{1,3}(\.\d{3})*(,\d{2})|\d+(\,\d{2})?')
+    pat_num = re.compile(r'[\$]?\s*\d{1,3}([.,]\d{3})*([.,]\d{2})|\d+([.,]\d{2})?')
     for line in lines:
         low = line.lower()
         if any(k in low for k in keys):
             m = pat_num.search(line)
             if m:
                 return to_num(m.group(0))
-    totals = re.findall(r'(?i)\btotal\b[^\d]{0,20}([\$]?\s*\d[\d\.\,]*)', text)
+    totals = re.findall(r'(?i)\btotal\b[^\d]{0,20}([\$]?\s*\d[\d\.,]*)', text)
     if totals:
         return to_num(totals[-1])
     return 0.0
 
-# ✅ PARCHE: flags como argumento, soporta CUIT con puntos: "C.U.I.T."
 def find_cuit(text: str):
     # "C.U.I.T:" / "CUIT :" / "CUIT"
     m = re.search(
@@ -229,7 +245,6 @@ def find_cuit(text: str):
         return f"{digits[:2]}-{digits[2:10]}-{digits[10:]}"
     return ""
 
-# ✅ PARCHE: flags como argumento, soporta "Factura" / "Facturas" / "FC"
 def find_pto_vta_y_nro(text: str):
     # 1) "Pto de Venta 0001 ... Comp. Nro 00000012"
     m = re.search(
@@ -249,13 +264,17 @@ def find_pto_vta_y_nro(text: str):
     if m:
         return (m.group(1), m.group(2))
 
-    # 3) Fallback línea por línea: si la línea menciona factura/FC/comprob/pto venta,
-    #    buscá un patrón 0001-00000012 en esa línea
+    # 3) Fallback línea por línea: permitir letras pegadas después del número (sin \b al final)
     for line in text.splitlines():
-        if re.search(r'\b(fact|fc|comprob|pto\.?\s*de\s*venta)\b', line, flags=re.IGNORECASE):
-            mm = re.search(r'\b(\d{4})-(\d{8})\b', line)
+        if re.search(r'\b(fact|fc|comprob|pto\.?\s*de\s*venta|n[°o]\b|num|nro)', line, flags=re.IGNORECASE):
+            mm = re.search(r'(\d{4})-(\d{8})(?!\d)', line)
             if mm:
                 return (mm.group(1), mm.group(2))
+
+    # 4) Último recurso: patrón global
+    mm = re.search(r'(\d{4})-(\d{8})(?!\d)', text)
+    if mm:
+        return (mm.group(1), mm.group(2))
 
     return ("", "")
 
@@ -264,7 +283,7 @@ def find_cae(text: str):
     return m.group(1) if m else ""
 
 def parse_invoice_text(text: str, known_vendors):
-    fecha = find_first_date(text)
+    fecha = find_issue_date(text)
     total = find_amount(text, ["importe total", "total a pagar", "total a facturar", "total"])
     iva   = find_amount(text, ["iva 21", "iva 10,5", "iva 10.5", "iva", "impuesto al valor agregado"])
     neto  = find_amount(text, ["neto gravado", "imp. neto gravado", "subtotal"])
@@ -445,11 +464,8 @@ c = c[c["TotalRound"].notna()]
 tmp0 = c[["RowID","CUIT_norm","Proveedor","TotalRound","FechaDay"]].copy()
 tmp0["Bucket"] = tmp0["FechaDay"]
 
-tmpm1 = tmp0.copy()
-tmpm1["Bucket"] = tmp0["FechaDay"] - pd.Timedelta(days=1)
-
-tmpp1 = tmp0.copy()
-tmpp1["Bucket"] = tmp0["FechaDay"] + pd.Timedelta(days=1)
+tmpm1 = tmp0.copy(); tmpm1["Bucket"] = tmp0["FechaDay"] - pd.Timedelta(days=1)
+tmpp1 = tmp0.copy(); tmpp1["Bucket"] = tmp0["FechaDay"] + pd.Timedelta(days=1)
 
 cand = pd.concat([tmp0, tmpm1, tmpp1], ignore_index=True)
 
