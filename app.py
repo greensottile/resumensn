@@ -1,13 +1,15 @@
-import os, re, io, hashlib, base64, unicodedata
+import os, re, hashlib, base64, unicodedata
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 from datetime import datetime
 
-# ========= Config =========
-st.set_page_config(page_title="Dashboard de Gastos (AFIP + CSVs + PDFs)", layout="wide")
+# =========================================
+# Config
+# =========================================
+st.set_page_config(page_title="Dashboard de Gastos (AFIP + CSVs + PDFs + Gmail)", layout="wide")
 
-# ---------- Gate por clave (Opción 1)
+# ---------- Gate por clave
 def gate():
     if st.session_state.get("auth_ok"):
         return
@@ -24,8 +26,9 @@ def gate():
 
 gate()
 
-
-# ========= Helpers =========
+# =========================================
+# Helpers
+# =========================================
 DEFAULT_CSV = "comprobantes_agosto_2025.csv"  # CSV opcional en el repo
 
 MAP_RUBRO = {
@@ -42,7 +45,7 @@ MAP_RUBRO = {
     "BONARDO CARLOS ALBERTO": "Transporte / Logística",
     "EBERHARDT AUGUSTO MARTIN": "Transporte / Logística",
 }
-# Extras (EPE)
+# Extras (EPE & similares)
 MAP_RUBRO.update({
     "EMP.PROVINCIAL DE LA ENERGÍA DE SANTA FE": "Energía / Electricidad",
     "EMPRESA PROVINCIAL DE LA ENERGIA": "Energía / Electricidad",
@@ -142,26 +145,42 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     )
     col_total = _pick_col(df,
         ["Importe Total","ImporteTotal","Total","Monto","Importe","Total Factura","Total a Pagar",
-         "Total con IVA","IMPORTE TOTAL A PAGAR"],
+         "Total con IVA","IMPORTE TOTAL A PAGAR","Imp. Total","Imp.Total"],
         regex=r"(importe|monto|total)"
     )
     col_cuit  = _pick_col(df,
-        ["CUIT","CUIT Emisor","CUIT_Emisor","C.U.I.T","CUIT Proveedor"],
-        regex=r"(cuit)"
+        ["CUIT","CUIT Emisor","CUIT_Emisor","C.U.I.T","CUIT Proveedor","Nro. Doc. Emisor"],
+        regex=r"(cuit|doc)"
     )
     col_pto   = _pick_col(df,
         ["PtoVta","Punto de Venta","Pto Vta","PV","Pto"],
         regex=r"(pto|punto.*venta|ptovta|pv)"
     )
     col_nro   = _pick_col(df,
-        ["NroCpbte","Nro Comprobante","Numero","Número","Comprobante","Nro Factura","Factura"],
-        regex=r"(n(ro|um)|comprob|factur)"
+        ["NroCpbte","Número Desde","Numero Desde","Nro Desde","Nro Comprobante","Número","Numero",
+         "Comprobante","Nro Factura","Factura"],
+        regex=r"(n(ro|um)|comprob|factur|desde)"
     )
-    col_cae   = _pick_col(df, ["CAE","Cod. Autorizacion","Codigo Autorizacion"], regex=r"(cae|autoriz)")
+    col_cae   = _pick_col(df, ["CAE","Cod. Autorizacion","Codigo Autorizacion","Cód. Autorización"], regex=r"(cae|autoriz)")
+    col_iva   = _pick_col(df, ["IVA","Importe IVA","I.V.A."], regex=r"\biva\b")
+    col_neto  = _pick_col(df, ["Imp. Neto Gravado","Neto Gravado","Subtotal","Base imponible"], regex=r"(neto|subtotal|base)")
+    col_no_grav = _pick_col(df, ["Imp. Neto No Gravado","No Gravado","Neto No Gravado"])
+    col_exentas = _pick_col(df, ["Imp. Op. Exentas","Exentas"])
+    col_otros   = _pick_col(df, ["Otros Tributos","Percepciones","Impuestos"])
 
     # Estándar
     df["Proveedor"] = df[col_prov].astype(str).fillna("Sin identificar") if col_prov else "Sin identificar"
-    df["Fecha"] = pd.to_datetime(df[col_fecha], errors="coerce", dayfirst=True) if col_fecha else pd.NaT
+
+    # Fecha: intentar ISO (yyyy-mm-dd) sin dayfirst, sino dayfirst=True
+    if col_fecha:
+        s = df[col_fecha].astype(str)
+        # Heurística: si luce ISO, parse month-first (False), sino day-first (True)
+        if s.str.match(r"\s*\d{4}-\d{2}-\d{2}\s*$").all():
+            df["Fecha"] = pd.to_datetime(s, errors="coerce", dayfirst=False)
+        else:
+            df["Fecha"] = pd.to_datetime(s, errors="coerce", dayfirst=True)
+    else:
+        df["Fecha"] = pd.NaT
 
     if col_total:
         df["ImporteTotal"] = df[col_total].apply(to_num)
@@ -235,8 +254,9 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 def to_csv_bytes(dfin: pd.DataFrame):
     return dfin.to_csv(index=False).encode("utf-8")
 
-
-# ========= PDFs =========
+# =========================================
+# PDFs (parser)
+# =========================================
 try:
     import fitz  # PyMuPDF
 except Exception:
@@ -346,6 +366,7 @@ def parse_invoice_text(text: str, known_vendors):
     pto, nro = find_pto_vta_y_nro(text)
     cae = find_cae(text)
 
+    # Proveedor por heurística
     low = text.lower()
     proveedor = None
     for name in MAP_RUBRO.keys():
@@ -372,7 +393,7 @@ def parse_invoice_text(text: str, known_vendors):
         "PtoVta": pto,
         "NroCpbte": nro,
         "CAE": cae,
-        "Fuente": "PDF Gmail",
+        "Fuente": "PDF",
     }
     row["Mes_dt"] = pd.to_datetime(row["Fecha"], errors="coerce").to_period("M") if pd.notna(row["Fecha"]) else pd.NaT
     row["Mes"] = str(row["Mes_dt"]) if pd.notna(row["Fecha"]) else ""
@@ -380,8 +401,9 @@ def parse_invoice_text(text: str, known_vendors):
     row["RowID"] = make_row_id(row)
     return row
 
-
-# ========= INTEGRACIÓN GMAIL =========
+# =========================================
+# INTEGRACIÓN GMAIL
+# =========================================
 try:
     from googleapiclient.discovery import build as gbuild
     from google.auth.transport.requests import Request as GRequest
@@ -456,11 +478,12 @@ def gmail_download_attachment(svc, msg_id, att_id):
     data = att.get("data")
     return base64.urlsafe_b64decode(data.encode("utf-8")) if data else b""
 
-
-# ========= Entrada de datos =========
+# =========================================
+# Entrada de datos (Sidebar)
+# =========================================
 st.sidebar.header("Datos")
 
-# CSVs múltiples (lector tolerante)
+# CSVs múltiples (intentos ordenados: AFIP suele ser ; + utf-8)
 uploaded_files = st.sidebar.file_uploader(
     "Subí uno o varios CSV (AFIP/otros)",
     type=["csv"],
@@ -475,23 +498,36 @@ use_default = st.sidebar.checkbox(
 
 frames = []
 
-# CSVs subidos (con fallback a autodetect sep / latin-1)
+# CSVs subidos (lector robusto)
 if uploaded_files:
     for f in uploaded_files:
-        try:
-            df_tmp = pd.read_csv(f)
-        except Exception:
-            f.seek(0)
-            df_tmp = pd.read_csv(f, sep=None, engine="python", encoding="latin-1")
-        df_tmp["Fuente"] = f.name
-        frames.append(df_tmp)
+        df_tmp = None
+        for args in [
+            dict(sep=";", engine="python", quotechar='"', encoding="utf-8"),   # AFIP típico
+            dict(),                                                           # intento rápido
+            dict(sep=None, engine="python", encoding="latin-1"),              # autodetect
+        ]:
+            try:
+                f.seek(0)
+                df_tmp = pd.read_csv(f, **args)
+                break
+            except Exception:
+                continue
+        if df_tmp is None:
+            st.sidebar.error(f"No se pudo leer `{f.name}`.")
+        else:
+            df_tmp["Fuente"] = f.name
+            frames.append(df_tmp)
 
 # CSV del repo
 if use_default and os.path.exists(DEFAULT_CSV):
     try:
-        df_repo = pd.read_csv(DEFAULT_CSV)
+        df_repo = pd.read_csv(DEFAULT_CSV, sep=";", engine="python", quotechar='"', encoding="utf-8")
     except Exception:
-        df_repo = pd.read_csv(DEFAULT_CSV, sep=None, engine="python", encoding="latin-1")
+        try:
+            df_repo = pd.read_csv(DEFAULT_CSV)
+        except Exception:
+            df_repo = pd.read_csv(DEFAULT_CSV, sep=None, engine="python", encoding="latin-1")
     df_repo["Fuente"] = DEFAULT_CSV
     frames.append(df_repo)
 
@@ -541,7 +577,7 @@ with st.sidebar.expander("📥 Importar desde Gmail (PDF adjuntos)", expanded=Fa
                     rows.append(row)
                     added += 1
                 processed += 1
-                progress.progress(min(i/total_msgs, 1.0))
+                progress.progress(min(i/max(total_msgs,1), 1.0))
         except Exception as e:
             st.error(f"Error leyendo Gmail: {e}")
 
@@ -587,7 +623,9 @@ with st.sidebar.expander("➕ Subir facturas PDF (uno o varios)", expanded=False
             for f in pdf_files:
                 try:
                     text = extract_text_from_pdf(f.read())
-                    rows.append(parse_invoice_text(text, list(MAP_RUBRO.keys())))
+                    row = parse_invoice_text(text, list(MAP_RUBRO.keys()))
+                    row["Fuente"] = f"PDF subido:{f.name}"
+                    rows.append(row)
                 except Exception as e:
                     st.warning(f"No se pudo procesar {f.name}: {e}")
             if rows:
@@ -609,7 +647,9 @@ with st.sidebar.expander("➕ Subir facturas PDF (uno o varios)", expanded=False
     except Exception:
         st.info("Para analizar PDFs se requiere PyMuPDF. Asegurate de tener 'pymupdf' en requirements.txt.")
 
-# ========= Consolidado + Dedupe fuerte =========
+# =========================================
+# Consolidado + sanity + dedupe
+# =========================================
 parts = []
 if not df_csv_all.empty:
     parts.append(df_csv_all)
@@ -625,19 +665,33 @@ if not parts:
 
 consolidated = pd.concat(parts, ignore_index=True, sort=False)
 
-# Asegurar columnas mínimas
-for col in ["Fecha","Mes_dt","Mes","ImporteTotal","Proveedor","Rubro","Clave","IVA","RowID",
-            "CUIT_Emisor","PtoVta","NroCpbte","CAE","Fuente"]:
+# --- SANITY para mezclar meses + PDFs sin romper ---
+# Asegurar tipos y columnas mínimas
+for col in ["Proveedor","CUIT_Emisor","PtoVta","NroCpbte","CAE","Fuente","Clave","RowID","Rubro","Mes"]:
     if col not in consolidated.columns:
-        if col in ["ImporteTotal","IVA"]:
-            consolidated[col] = 0.0
-        else:
-            consolidated[col] = ""
+        consolidated[col] = ""
+    consolidated[col] = consolidated[col].astype(str).fillna("")
 
-# Recalcular Mes si faltan valores
-if consolidated["Mes"].eq("").any():
-    consolidated["Mes_dt"] = pd.to_datetime(consolidated["Fecha"], errors="coerce").to_period("M")
-    consolidated["Mes"] = consolidated["Mes_dt"].astype(str)
+for col in ["ImporteTotal","IVA","Imp. Neto Gravado","Imp. Neto No Gravado","Imp. Op. Exentas","Otros Tributos"]:
+    if col not in consolidated.columns:
+        consolidated[col] = 0.0
+    consolidated[col] = pd.to_numeric(consolidated[col], errors="coerce").fillna(0.0)
+
+# Fecha -> datetime
+consolidated["Fecha"] = pd.to_datetime(consolidated["Fecha"], errors="coerce")
+
+# Mes/Mes_dt
+if "Mes_dt" not in consolidated.columns:
+    consolidated["Mes_dt"] = pd.NaT
+consolidated["Mes_dt"] = consolidated["Fecha"].dt.to_period("M")
+consolidated["Mes"] = consolidated["Mes_dt"].astype(str)
+
+# Clave/RowID: recomputar si falta o está vacía
+mask_blank_clave = consolidated["Clave"].eq("") | consolidated["Clave"].isna()
+if mask_blank_clave.any():
+    consolidated.loc[mask_blank_clave, "Clave"] = consolidated.loc[mask_blank_clave].apply(make_key_from_row, axis=1)
+# RowID siempre consistente
+consolidated["RowID"] = consolidated.apply(make_row_id, axis=1)
 
 # Dedupe por Clave (fuerte)
 count_before = len(consolidated)
@@ -645,10 +699,17 @@ consolidated = consolidated.drop_duplicates(subset=["Clave"], keep="first")
 count_after = len(consolidated)
 dups_removed = count_before - count_after
 
-# ========= Duplicados potenciales (mismo total y ±1 día) =========
+# =========================================
+# Duplicados potenciales (mismo total y ±1 día) - blindado
+# =========================================
 c = consolidated.copy()
-c["CUIT_norm"] = c["CUIT_Emisor"].apply(digits_only)
-c["TotalRound"] = c["ImporteTotal"].round(2)
+
+for col in ["RowID","Proveedor","Fecha","ImporteTotal","CUIT_Emisor","PtoVta","NroCpbte","CAE","Fuente","Clave"]:
+    if col not in c.columns:
+        c[col] = "" if col not in ["ImporteTotal","Fecha"] else (0.0 if col=="ImporteTotal" else pd.NaT)
+
+c["CUIT_norm"] = c["CUIT_Emisor"].str.replace(r"\D", "", regex=True)
+c["TotalRound"] = pd.to_numeric(c["ImporteTotal"], errors="coerce").round(2).fillna(0.0)
 c["FechaDay"] = pd.to_datetime(c["Fecha"], errors="coerce").dt.floor("D")
 
 c = c.dropna(subset=["FechaDay"])
@@ -656,10 +717,8 @@ c = c[c["TotalRound"].notna()]
 
 tmp0 = c[["RowID","CUIT_norm","Proveedor","TotalRound","FechaDay"]].copy()
 tmp0["Bucket"] = tmp0["FechaDay"]
-
 tmpm1 = tmp0.copy(); tmpm1["Bucket"] = tmp0["FechaDay"] - pd.Timedelta(days=1)
 tmpp1 = tmp0.copy(); tmpp1["Bucket"] = tmp0["FechaDay"] + pd.Timedelta(days=1)
-
 cand = pd.concat([tmp0, tmpm1, tmpp1], ignore_index=True)
 
 cand["ClaveGrupo"] = cand.apply(
@@ -673,13 +732,21 @@ grupo_validos = set(grp[grp > 1].index)
 
 pot = cand[cand["ClaveGrupo"].isin(grupo_validos)].merge(
     c[["RowID","Proveedor","Fecha","ImporteTotal","CUIT_Emisor","PtoVta","NroCpbte","CAE","Fuente","Clave"]],
-    on="RowID",
-    how="left"
+    on="RowID", how="left"
 )
 
-pot_unique = pot.sort_values("Bucket").drop_duplicates(subset=["RowID"], keep="first").copy()
-pot_unique.rename(columns={"Bucket":"GrupoFecha"}, inplace=True)
-pot_unique["GrupoFecha"] = pot_unique["GrupoFecha"].dt.date
+if "Bucket" in pot.columns:
+    pot.rename(columns={"Bucket": "GrupoFecha"}, inplace=True)
+else:
+    pot["GrupoFecha"] = pd.NaT
+
+dup_cols = ["RowID","ClaveGrupo","GrupoFecha","Proveedor","Fecha","ImporteTotal",
+            "CUIT_Emisor","PtoVta","NroCpbte","CAE","Fuente","Clave"]
+for col in dup_cols:
+    if col not in pot.columns:
+        pot[col] = (0.0 if col=="ImporteTotal" else (pd.NaT if col in ["Fecha","GrupoFecha"] else ""))
+
+pot_unique = pot.sort_values("GrupoFecha").drop_duplicates(subset=["RowID"], keep="first").copy()
 
 if "manual_exclude_ids" not in st.session_state:
     st.session_state["manual_exclude_ids"] = set()
@@ -689,16 +756,13 @@ with st.expander("🔍 Duplicados potenciales (mismo total y ±1 día)", expande
         st.write("No se detectaron duplicados potenciales con los criterios actuales.")
     else:
         st.caption(
-            "Criterio: mismo **Total** (redondeado a 2 decimales) y **misma fecha**, "
-            "o dentro de una ventana de **±1 día**. Se prioriza CUIT; si no hay, se usa Proveedor."
+            "Criterio: mismo **Total** (a 2 decimales) y **misma fecha** o **±1 día**. "
+            "Se agrupa por CUIT si existe; si no, por Proveedor."
         )
         st.write(f"Grupos detectados: **{len(grupo_validos)}** · Registros potencialmente duplicados: **{len(pot_unique)}**")
 
-        pot_show = pot_unique[[
-            "RowID","ClaveGrupo","GrupoFecha","Proveedor","Fecha","ImporteTotal",
-            "CUIT_Emisor","PtoVta","NroCpbte","CAE","Fuente","Clave"
-        ]].copy()
-        pot_show.insert(0, "Excluir", pot_show["RowID"].isin(st.session_state["manual_exclude_ids"]))
+        pot_show = pot_unique.reindex(columns=dup_cols).copy()
+        pot_show.insert(0, "Excluir", pot_show["RowID"].isin(st.session_state.get("manual_exclude_ids", set())))
 
         edited = st.data_editor(
             pot_show,
@@ -708,10 +772,11 @@ with st.expander("🔍 Duplicados potenciales (mismo total y ±1 día)", expande
                 "Excluir": st.column_config.CheckboxColumn(help="Marcá los que quieras excluir del consolidado."),
                 "ImporteTotal": st.column_config.NumberColumn(format="%.2f"),
                 "Fecha": st.column_config.DatetimeColumn(format="DD/MM/YYYY"),
+                "GrupoFecha": st.column_config.DateColumn(format="DD/MM/YYYY"),
             }
         )
 
-        c1, c2, c3 = st.columns(3)
+        c1, c2, _ = st.columns(3)
         if c1.button("Aplicar exclusiones"):
             to_exclude = set(edited.loc[edited["Excluir"], "RowID"].tolist())
             st.session_state["manual_exclude_ids"] = to_exclude
@@ -720,6 +785,7 @@ with st.expander("🔍 Duplicados potenciales (mismo total y ±1 día)", expande
         if c2.button("Limpiar exclusiones manuales"):
             st.session_state["manual_exclude_ids"] = set()
             st.rerun()
+
         st.download_button(
             "⬇️ Descargar duplicados potenciales (CSV)",
             data=to_csv_bytes(pot_show.drop(columns=["Excluir"])),
@@ -727,10 +793,13 @@ with st.expander("🔍 Duplicados potenciales (mismo total y ±1 día)", expande
             mime="text/csv"
         )
 
+# Aplicar exclusiones manuales al consolidado
 if st.session_state["manual_exclude_ids"]:
     consolidated = consolidated[~consolidated["RowID"].isin(st.session_state["manual_exclude_ids"])]
 
-# ========= Resumen de fuentes =========
+# =========================================
+# Resumen de fuentes
+# =========================================
 with st.sidebar.expander("Resumen de archivos cargados", expanded=False):
     try:
         resumen = consolidated.groupby("Fuente", as_index=False).agg(
@@ -743,7 +812,9 @@ with st.sidebar.expander("Resumen de archivos cargados", expanded=False):
     except Exception:
         st.write("No disponible.")
 
-# ========= Filtros globales =========
+# =========================================
+# Filtros globales
+# =========================================
 st.sidebar.header("Filtros")
 
 min_date = pd.to_datetime(consolidated["Fecha"]).min()
@@ -769,13 +840,15 @@ if len(df) == 0:
     st.info("No hay datos que cumplan los filtros seleccionados.")
     st.stop()
 
-# ========= KPIs =========
+# =========================================
+# KPIs
+# =========================================
 total = df["ImporteTotal"].sum()
 cant = len(df)
 ticket = total / cant if cant else 0.0
 iva = df["IVA"].sum()
 
-st.title("📊 Dashboard de Gastos (AFIP + CSVs + PDFs)")
+st.title("📊 Dashboard de Gastos (AFIP + CSVs + PDFs + Gmail)")
 st.caption(
     f"Consolidado con deduplicado por clave. Duplicados descartados automáticamente: **{dups_removed}**. "
     f"Exclusiones manuales aplicadas: **{len(st.session_state.get('manual_exclude_ids', []))}**."
@@ -786,7 +859,9 @@ c2.metric("🧾 Cant. de Facturas", f"{cant}")
 c3.metric("🧮 Ticket Promedio", f"${ticket:,.2f}")
 c4.metric("🧾 IVA (Crédito)", f"${iva:,.2f}")
 
-# ========= Gráficos (con selectores propios) =========
+# =========================================
+# Gráficos (con selectores propios)
+# =========================================
 st.subheader("Gráficos")
 
 global_min = pd.to_datetime(df["Fecha"]).min().date()
@@ -842,7 +917,9 @@ st.plotly_chart(
     use_container_width=True
 )
 
-# ========= Detalle + descarga =========
+# =========================================
+# Detalle + descarga
+# =========================================
 st.subheader("Detalle (filtrado)")
 st.dataframe(df.sort_values("Fecha", ascending=False), use_container_width=True)
 
