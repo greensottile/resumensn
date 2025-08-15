@@ -1,4 +1,4 @@
-import os, re, io, hashlib
+import os, re, io, hashlib, base64
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -297,7 +297,7 @@ def parse_invoice_text(text: str, known_vendors):
     # Proveedor por heurística simple
     low = text.lower()
     proveedor = None
-    for name in known_vendors:
+    for name in MAP_RUBRO.keys():
         if name.lower() in low:
             proveedor = name
             break
@@ -321,7 +321,7 @@ def parse_invoice_text(text: str, known_vendors):
         "PtoVta": pto,
         "NroCpbte": nro,
         "CAE": cae,
-        "Fuente": "PDF subido",
+        "Fuente": "PDF Gmail",
     }
     row["Mes_dt"] = pd.to_datetime(row["Fecha"], errors="coerce").to_period("M") if pd.notna(row["Fecha"]) else pd.NaT
     row["Mes"] = str(row["Mes_dt"]) if pd.notna(row["Fecha"]) else ""
@@ -329,6 +329,83 @@ def parse_invoice_text(text: str, known_vendors):
     row["RowID"] = make_row_id(row)
     return row
 
+
+# ========= INTEGRACIÓN GMAIL =========
+# Requiere setear en Secrets un bloque "gmail_oauth" con:
+# client_id, client_secret, refresh_token, token_uri="https://oauth2.googleapis.com/token"
+try:
+    from googleapiclient.discovery import build as gbuild
+    from google.auth.transport.requests import Request as GRequest
+    from google.oauth2.credentials import Credentials as GCredentials
+except Exception:
+    gbuild = None
+
+def gmail_creds_from_secrets():
+    if gbuild is None:
+        st.warning("Faltan librerías de Google. Agregá google-api-python-client, google-auth, google-auth-oauthlib a requirements.txt")
+        return None
+    info = st.secrets.get("gmail_oauth")
+    if not info:
+        st.info("Configurá en **Secrets** el bloque [gmail_oauth] con client_id, client_secret y refresh_token.")
+        return None
+    scopes = ["https://www.googleapis.com/auth/gmail.readonly"]
+    creds = GCredentials(
+        token=None,
+        refresh_token=info.get("refresh_token"),
+        token_uri=info.get("token_uri","https://oauth2.googleapis.com/token"),
+        client_id=info.get("client_id"),
+        client_secret=info.get("client_secret"),
+        scopes=scopes
+    )
+    try:
+        creds.refresh(GRequest())
+    except Exception as e:
+        st.error(f"No se pudo refrescar el token de Gmail: {e}")
+        return None
+    return creds
+
+def gmail_service(creds):
+    return gbuild("gmail", "v1", credentials=creds, cache_discovery=False)
+
+def gmail_iter_messages(svc, q, max_pages=5):
+    user_id = "me"
+    token = None
+    pages = 0
+    while True:
+        resp = svc.users().messages().list(userId=user_id, q=q, maxResults=500, pageToken=token).execute()
+        for m in resp.get("messages", []):
+            yield m["id"]
+        token = resp.get("nextPageToken")
+        pages += 1
+        if not token or pages >= max_pages:
+            break
+
+def msg_headers_dict(payload):
+    out = {}
+    for h in payload.get("headers", []):
+        name = (h.get("name") or "").lower()
+        val = h.get("value") or ""
+        if name in ("from","subject","date"):
+            out[name] = val
+    return out
+
+def iter_pdf_parts(payload):
+    stack = [payload]
+    while stack:
+        p = stack.pop()
+        if "parts" in p:
+            stack.extend(p["parts"])
+        filename = p.get("filename") or ""
+        mime = p.get("mimeType") or ""
+        body = p.get("body", {})
+        att_id = body.get("attachmentId")
+        if att_id and (filename.lower().endswith(".pdf") or mime == "application/pdf"):
+            yield att_id, filename
+
+def gmail_download_attachment(svc, msg_id, att_id):
+    att = svc.users().messages().attachments().get(userId="me", messageId=msg_id, id=att_id).execute()
+    data = att.get("data")
+    return base64.urlsafe_b64decode(data.encode("utf-8")) if data else b""
 
 # ========= Entrada de datos =========
 st.sidebar.header("Datos")
@@ -366,6 +443,78 @@ if use_default and os.path.exists(DEFAULT_CSV):
         frames.append(df_repo)
     except Exception as e:
         st.sidebar.error(f"No se pudo leer `{DEFAULT_CSV}` del repo: {e}")
+
+# --------- NUEVO: Importar desde Gmail ----------
+with st.sidebar.expander("📥 Importar desde Gmail (PDF adjuntos)", expanded=False):
+    st.caption("Requiere `gmail_oauth` en **Secrets** (client_id, client_secret, refresh_token).")
+    # Filtros rápidos (se combinan en una query Gmail)
+    dflt_start = datetime(datetime.now().year, 1, 1).date()
+    d_from = st.date_input("Desde fecha", value=dflt_start, help="Filtro: after:YYYY/MM/DD")
+    remitentes = st.text_input("Remitentes (coma)", value="facturas@,afip,facturacion@,billing@,noreply@")
+    asunto = st.text_input("Asunto contiene", value="factura, comprobante, invoice, fc, pdf")
+    max_pages = st.number_input("Máx. páginas a leer (x500 mensajes)", min_value=1, max_value=20, value=3)
+    if st.button("🔎 Buscar y procesar Gmail"):
+        creds = gmail_creds_from_secrets()
+        if creds is None:
+            st.stop()
+        svc = gmail_service(creds)
+        # Construir query
+        q = f"has:attachment filename:pdf after:{d_from.strftime('%Y/%m/%d')} "
+        if remitentes.strip():
+            ors = " OR ".join([f"from:{x.strip()}" for x in remitentes.split(",") if x.strip()])
+            if ors: q += f"({ors}) "
+        if asunto.strip():
+            ors = " OR ".join([f"subject:{x.strip()}" for x in asunto.split(",") if x.strip()])
+            if ors: q += f"({ors}) "
+        st.write(f"Query: `{q}`")
+
+        progress = st.progress(0)
+        processed, added = 0, 0
+        rows = []
+
+        try:
+            msg_ids = list(gmail_iter_messages(svc, q, max_pages=int(max_pages)))
+            total_msgs = len(msg_ids)
+            for i, mid in enumerate(msg_ids, start=1):
+                msg = svc.users().messages().get(userId="me", id=mid, format="full").execute()
+                payload = msg.get("payload", {})
+                headers = msg_headers_dict(payload)
+                for att_id, fname in iter_pdf_parts(payload):
+                    data = gmail_download_attachment(svc, mid, att_id)
+                    if not data:
+                        continue
+                    if fitz is None:
+                        st.warning("PyMuPDF no está instalado; no se pueden leer PDFs.")
+                        continue
+                    text = extract_text_from_pdf(data)
+                    row = parse_invoice_text(text, list(MAP_RUBRO.keys()))
+                    # Registrar fuente legible
+                    row["Fuente"] = f"Gmail:{headers.get('from','?')} · {headers.get('subject','')}"
+                    rows.append(row)
+                    added += 1
+                processed += 1
+                progress.progress(min(i/total_msgs, 1.0))
+        except Exception as e:
+            st.error(f"Error leyendo Gmail: {e}")
+
+        if rows:
+            new_pdf_df = pd.DataFrame(rows).drop_duplicates(subset=["Clave"], keep="first")
+            if "pdf_df" not in st.session_state:
+                st.session_state["pdf_df"] = pd.DataFrame(columns=[
+                    "Proveedor","Fecha","ImporteTotal","IVA","Imp. Neto Gravado","Imp. Neto No Gravado",
+                    "Imp. Op. Exentas","Otros Tributos","CUIT_Emisor","PtoVta","NroCpbte","CAE",
+                    "Fuente","Mes_dt","Mes","Clave","RowID"
+                ])
+            before = len(st.session_state["pdf_df"])
+            st.session_state["pdf_df"] = pd.concat(
+                [st.session_state["pdf_df"], new_pdf_df],
+                ignore_index=True
+            ).drop_duplicates(subset=["Clave"], keep="first")
+            after = len(st.session_state["pdf_df"])
+            st.success(f"📬 Procesados {processed} mensajes. Agregados {added} PDFs (únicos: {after-before}).")
+            st.rerun()
+        else:
+            st.info("No se encontraron PDFs nuevos con la query indicada.")
 
 # Normalizar CSVs
 df_csv_all = pd.DataFrame()
@@ -424,7 +573,7 @@ if not st.session_state["pdf_df"].empty:
 if not parts:
     st.warning(
         "No se encontraron datos. Subí CSVs desde la barra lateral, agregá "
-        f"`{DEFAULT_CSV}` al repo o cargá PDFs."
+        f"`{DEFAULT_CSV}` al repo o cargá PDFs/Gmail."
     )
     st.stop()
 
